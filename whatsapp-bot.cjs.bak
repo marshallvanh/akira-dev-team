@@ -1,0 +1,624 @@
+const { Client, LocalAuth } = require("whatsapp-web.js");
+const qrcode = require("qrcode-terminal");
+const Anthropic = require("@anthropic-ai/sdk");
+const fs = require("fs");
+const path = require("path");
+
+const akira = require("./akira-core.cjs");
+const tetsuo = require("./tetsuo-worker.cjs");
+const architect = require("./architect-worker.cjs");
+const reviewer = require("./reviewer-worker.cjs");
+
+const client = new Client({
+  authStrategy: new LocalAuth({
+    clientId: "akira-chief-of-staff",
+  }),
+  puppeteer: {
+    headless: false,
+  },
+});
+
+const anthropic = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY,
+});
+
+const MODEL = "claude-haiku-4-5";
+const WORKSPACE = path.join(__dirname, "workspace");
+const MANIFEST_FILE = path.join(WORKSPACE, "build-manifest.json");
+const AUTO_TASK_LIMIT = 3;
+
+function cleanJson(text) {
+  return text
+    .replace(/```json/g, "")
+    .replace(/```/g, "")
+    .trim();
+}
+
+function formatProjectState() {
+  const state = akira.getState();
+
+  return [
+    `Project: ${state.project_name || "Not started"}`,
+    `Summary: ${state.project_summary || "None yet"}`,
+    `Target user: ${state.target_user || "Not defined"}`,
+    `Milestone: ${state.milestone}`,
+    `Status: ${state.status}`,
+    `Current focus: ${state.current_focus || "None"}`,
+    `Next action: ${state.next_action || "None"}`,
+    `Open tasks: ${state.tasks.length}`,
+    `Completed tasks: ${state.completed_tasks.length}`,
+    `Blocked tasks: ${state.blocked_tasks.length}`
+  ].join("\n");
+}
+
+function formatTaskList(tasks) {
+  return tasks
+    .map(
+      (task) =>
+        `${task.id} — ${task.title}\n` +
+        `Description: ${task.description || "No description"}\n` +
+        `Deliverable: ${task.deliverable || "No deliverable"}`
+    )
+    .join("\n\n");
+}
+
+function formatDevStatus() {
+  const state = akira.getState();
+
+  if (
+    state.tasks.length === 0 &&
+    state.completed_tasks.length === 0 &&
+    state.blocked_tasks.length === 0
+  ) {
+    return "No dev work tracked yet.";
+  }
+
+  let reply = "Dev Team Status\n\n";
+
+  if (state.tasks.length > 0) {
+    reply += "Open Tasks\n";
+    reply += formatTaskList(state.tasks.slice(-10).reverse());
+    reply += "\n\n";
+  }
+
+  if (state.completed_tasks.length > 0) {
+    reply += "Recently Completed\n";
+    reply += formatTaskList(state.completed_tasks.slice(-5).reverse());
+    reply += "\n\n";
+  }
+
+  if (state.blocked_tasks.length > 0) {
+    reply += "Blocked Tasks\n";
+    reply += state.blocked_tasks
+      .slice(-5)
+      .reverse()
+      .map(
+        (task) =>
+          `${task.id} — ${task.title}\nReason: ${task.block_reason || "Blocked"}`
+      )
+      .join("\n\n");
+  }
+
+  return reply.trim();
+}
+
+function formatWorkerReports() {
+  const reports = akira.getWorkerReports();
+
+  if (reports.length === 0) {
+    return "No worker reports yet.";
+  }
+
+  return (
+    "Tetsuo Reports\n\n" +
+    reports
+      .slice(-5)
+      .reverse()
+      .map((report) => `${report.task_id}\n${report.report}`)
+      .join("\n\n")
+  );
+}
+
+function formatReviews() {
+  const reviews = akira.getReviews();
+
+  if (reviews.length === 0) {
+    return "No reviews yet.";
+  }
+
+  return (
+    "Review Reports\n\n" +
+    reviews
+      .slice(-5)
+      .reverse()
+      .map((review) => {
+        const issues =
+          Array.isArray(review.issues) && review.issues.length > 0
+            ? review.issues.join("\n- ")
+            : "None";
+        return (
+          `${review.task_id}\n` +
+          `Decision: ${review.decision}\n` +
+          `Summary: ${review.summary}\n` +
+          `Issues: ${issues}\n` +
+          `Next action: ${review.next_action}`
+        );
+      })
+      .join("\n\n")
+  );
+}
+
+function formatManifest() {
+  if (!fs.existsSync(MANIFEST_FILE)) {
+    return "No build files yet.";
+  }
+
+  try {
+    const manifest = JSON.parse(fs.readFileSync(MANIFEST_FILE, "utf8"));
+
+    if (!Array.isArray(manifest.files) || manifest.files.length === 0) {
+      return "No build files yet.";
+    }
+
+    return (
+      "Build Files\n\n" +
+      manifest.files
+        .slice(-20)
+        .map((file) => file.path)
+        .join("\n")
+    );
+  } catch {
+    return "Could not read build manifest.";
+  }
+}
+
+async function interpretMessage(userMessage, state) {
+  const prompt = `
+You are an intent router for an AI development team assistant.
+
+Current project state:
+${JSON.stringify(state, null, 2)}
+
+User message:
+${userMessage}
+
+Return ONLY valid JSON:
+
+{
+  "intent": "brainstorm_project | build_project | create_task | run_next_task | start_development | run_task | dev_status | project_state | reports | reviews | build_files | review_last | general_chat",
+  "reply": "natural short human reply",
+  "project_idea": "",
+  "task_id": "",
+  "task_text": ""
+}
+
+Rules:
+- Be typo-tolerant
+- If the user is exploring an idea or discussing possibilities, use brainstorm_project
+- If the user clearly wants to turn an idea into a real project plan, use build_project
+- If the user wants execution of one task, use run_next_task or run_task
+- If the user wants the team to continue working through tasks, use start_development
+- If the user asks what has been built or what files exist, use build_files
+- If the user asks to review or check what Tetsuo produced, use review_last
+- If the user asks about review/reviewer/quality, use reviews
+`;
+
+  const response = await anthropic.messages.create({
+    model: MODEL,
+    max_tokens: 250,
+    messages: [
+      {
+        role: "user",
+        content: prompt
+      }
+    ]
+  });
+
+  const raw = cleanJson(response.content[0].text || "");
+
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return {
+      intent: "general_chat",
+      reply: "Got it — talk me through what you're thinking and I'll help shape it.",
+      project_idea: "",
+      task_id: "",
+      task_text: ""
+    };
+  }
+}
+
+async function reviewCompletedTask(result) {
+  const task = akira.getTaskById(result.taskId);
+
+  if (!task) {
+    return null;
+  }
+
+  const review = await reviewer.reviewTask({
+    projectState: akira.getState(),
+    task,
+    report: result.output
+  });
+
+  akira.addReview(task.id, review);
+  akira.setNextAction(review.next_action || "Review next task");
+
+  let revisionTask = null;
+
+  if (String(review.decision).toLowerCase() === "revise") {
+    revisionTask = akira.createRevisionTask(task, review);
+    akira.setNextAction(`Tetsuo to revise ${task.id} via ${revisionTask.id}`);
+  }
+
+  return {
+    review,
+    revisionTask
+  };
+}
+
+async function reviewLatestWork() {
+  const reviews = akira.getReviews();
+  const latest = reviews[reviews.length - 1];
+
+  if (!latest) {
+    return "There’s nothing reviewed yet.";
+  }
+
+  let reply =
+    `Latest review for ${latest.task_id}\n\n` +
+    `Decision: ${latest.decision}\n` +
+    `Summary: ${latest.summary}\n` +
+    `Issues: ${
+      Array.isArray(latest.issues) && latest.issues.length > 0
+        ? latest.issues.join("\n- ")
+        : "None"
+    }\n` +
+    `Next action: ${latest.next_action}`;
+
+  const state = akira.getState();
+  const revisionTask = state.tasks.find(
+    (t) => t.parent_task_id && String(t.parent_task_id).toLowerCase() === String(latest.task_id).toLowerCase()
+  );
+
+  if (revisionTask) {
+    reply += `\n\nRevision task created:\n${revisionTask.id} — ${revisionTask.title}`;
+  }
+
+  return reply;
+}
+
+async function runAutoDevelopment(message) {
+  let completed = 0;
+  let allReplies = [];
+
+  while (completed < AUTO_TASK_LIMIT) {
+    const result = await tetsuo.runNextTask();
+
+    if (!result.ok) {
+      if (completed === 0) {
+        await message.reply(`No task executed.\n\n${result.error}`);
+      } else {
+        allReplies.push(`Stopped because: ${result.error}`);
+        await message.reply(allReplies.join("\n\n"));
+      }
+      return;
+    }
+
+    let reply = `Tetsuo completed ${result.taskId}.\n\n${result.output}`;
+
+    if (Array.isArray(result.files) && result.files.length > 0) {
+      reply += `\n\nFiles created:\n${result.files.join("\n")}`;
+    }
+
+    const reviewed = await reviewCompletedTask(result);
+
+    if (reviewed?.review) {
+      reply +=
+        `\n\nReviewer\n` +
+        `Decision: ${reviewed.review.decision}\n` +
+        `Summary: ${reviewed.review.summary}\n` +
+        `Next action: ${reviewed.review.next_action}`;
+    }
+
+    if (reviewed?.revisionTask) {
+      reply +=
+        `\n\nRevision task created automatically:\n` +
+        `${reviewed.revisionTask.id} — ${reviewed.revisionTask.title}`;
+    }
+
+    allReplies.push(reply);
+    completed += 1;
+
+    const state = akira.getState();
+    if (!state.tasks || state.tasks.length === 0) {
+      allReplies.push("Development run complete — no more open tasks.");
+      await message.reply(allReplies.join("\n\n"));
+      return;
+    }
+  }
+
+  allReplies.push(
+    `Paused after ${AUTO_TASK_LIMIT} tasks for safety.\nSend "start development" again to continue.`
+  );
+  await message.reply(allReplies.join("\n\n"));
+}
+
+client.on("qr", (qr) => {
+  console.log("\nScan the QR code below with WhatsApp\n");
+  qrcode.generate(qr, { small: true });
+});
+
+client.on("ready", () => {
+  console.log("Akira Dev Team Core is online");
+});
+
+client.on("authenticated", () => {
+  console.log("WhatsApp authenticated");
+});
+
+client.on("message", async (message) => {
+  try {
+    if (message.fromMe) return;
+
+    const originalMessage = String(message.body || "").trim();
+    if (!originalMessage) return;
+
+    akira.saveMemory(originalMessage);
+
+    const state = akira.getState();
+    const text = originalMessage.toLowerCase();
+
+    if (text === "project state" || text === "state" || text === "akira state") {
+      await message.reply(formatProjectState());
+      return;
+    }
+
+    if (text === "dev status" || text === "akira dev status") {
+      await message.reply(formatDevStatus());
+      return;
+    }
+
+    if (text === "reports" || text === "tetsuo reports") {
+      await message.reply(formatWorkerReports());
+      return;
+    }
+
+    if (text === "reviews" || text === "review reports") {
+      await message.reply(formatReviews());
+      return;
+    }
+
+    if (text === "build files" || text === "what files have been built") {
+      await message.reply(formatManifest());
+      return;
+    }
+
+    if (text === "review latest" || text === "review the latest work") {
+      await message.reply(await reviewLatestWork());
+      return;
+    }
+
+    if (text.startsWith("run task ")) {
+      const taskId = originalMessage.slice("run task ".length).trim();
+      const task = akira.getTaskById(taskId);
+
+      if (!task) {
+        await message.reply(`I couldn't find ${taskId}.`);
+        return;
+      }
+
+      if (task.status !== "pending") {
+        await message.reply(`${task.id} is not pending. Current status: ${task.status}`);
+        return;
+      }
+
+      await message.reply(`Got it — Tetsuo is starting ${task.id}.`);
+
+      const result = await tetsuo.runTask(task);
+
+      if (!result.ok) {
+        await message.reply(`Tetsuo couldn't complete ${task.id}.\nReason: ${result.error}`);
+        return;
+      }
+
+      let reply = `Tetsuo completed ${result.taskId}.\n\n${result.output}`;
+      if (Array.isArray(result.files) && result.files.length > 0) {
+        reply += `\n\nFiles created:\n${result.files.join("\n")}`;
+      }
+
+      const reviewed = await reviewCompletedTask(result);
+
+      if (reviewed?.review) {
+        reply +=
+          `\n\nReviewer\n` +
+          `Decision: ${reviewed.review.decision}\n` +
+          `Summary: ${reviewed.review.summary}\n` +
+          `Next action: ${reviewed.review.next_action}`;
+      }
+
+      if (reviewed?.revisionTask) {
+        reply +=
+          `\n\nRevision task created automatically:\n` +
+          `${reviewed.revisionTask.id} — ${reviewed.revisionTask.title}`;
+      }
+
+      await message.reply(reply);
+      return;
+    }
+
+    const interpreted = await interpretMessage(originalMessage, state);
+
+    if (interpreted.intent === "brainstorm_project") {
+      akira.setDraftProjectIdea(interpreted.project_idea || originalMessage);
+
+      const brainstorm = await architect.brainstormIdea(interpreted.project_idea || originalMessage);
+
+      await message.reply(
+        `${brainstorm}\n\nWhen you're ready, say something like "ok build it" or "turn that into a project".`
+      );
+      return;
+    }
+
+    if (interpreted.intent === "build_project") {
+      const idea =
+        interpreted.project_idea ||
+        state.draft_project_idea ||
+        originalMessage;
+
+      await message.reply("Got it — I’m getting the Architect to turn that into a proper project plan.");
+
+      const plan = await architect.createPlan(idea);
+
+      akira.startProject(plan);
+
+      const createdTasks = [];
+      for (const taskInput of plan.tasks) {
+        const task = akira.createTask(taskInput);
+        createdTasks.push(task);
+      }
+
+      const reply =
+        `Project created\n\n` +
+        `Name: ${plan.project_name}\n` +
+        `Summary: ${plan.project_summary}\n` +
+        `Target user: ${plan.target_user}\n` +
+        `Milestone: ${plan.milestone}\n\n` +
+        `Tasks\n\n` +
+        formatTaskList(createdTasks);
+
+      await message.reply(reply);
+      return;
+    }
+
+    if (interpreted.intent === "create_task") {
+      const task = akira.createTask({
+        title: interpreted.task_text || originalMessage,
+        description: "Created from Marshall's request through Akira.",
+        deliverable: "A practical implementation outcome"
+      });
+
+      await message.reply(
+        `Task created\n\n` +
+        `${task.id} — ${task.title}\n` +
+        `Description: ${task.description}\n` +
+        `Deliverable: ${task.deliverable}\n` +
+        `Assigned to: Tetsuo`
+      );
+      return;
+    }
+
+    if (interpreted.intent === "run_next_task") {
+      await message.reply("Got it — Tetsuo is starting the next task.");
+
+      const result = await tetsuo.runNextTask();
+
+      if (!result.ok) {
+        await message.reply(`No task executed.\n\n${result.error}`);
+        return;
+      }
+
+      let reply = `Tetsuo completed ${result.taskId}.\n\n${result.output}`;
+      if (Array.isArray(result.files) && result.files.length > 0) {
+        reply += `\n\nFiles created:\n${result.files.join("\n")}`;
+      }
+
+      const reviewed = await reviewCompletedTask(result);
+
+      if (reviewed?.review) {
+        reply +=
+          `\n\nReviewer\n` +
+          `Decision: ${reviewed.review.decision}\n` +
+          `Summary: ${reviewed.review.summary}\n` +
+          `Next action: ${reviewed.review.next_action}`;
+      }
+
+      if (reviewed?.revisionTask) {
+        reply +=
+          `\n\nRevision task created automatically:\n` +
+          `${reviewed.revisionTask.id} — ${reviewed.revisionTask.title}`;
+      }
+
+      await message.reply(reply);
+      return;
+    }
+
+    if (interpreted.intent === "start_development") {
+      await message.reply("Got it — I’m starting a development run with Tetsuo.");
+      await runAutoDevelopment(message);
+      return;
+    }
+
+    if (interpreted.intent === "review_last") {
+      await message.reply(await reviewLatestWork());
+      return;
+    }
+
+    if (interpreted.intent === "build_files") {
+      await message.reply(formatManifest());
+      return;
+    }
+
+    if (interpreted.intent === "dev_status") {
+      await message.reply(formatDevStatus());
+      return;
+    }
+
+    if (interpreted.intent === "project_state") {
+      await message.reply(formatProjectState());
+      return;
+    }
+
+    if (interpreted.intent === "reports") {
+      await message.reply(formatWorkerReports());
+      return;
+    }
+
+    if (interpreted.intent === "reviews") {
+      await message.reply(formatReviews());
+      return;
+    }
+
+    const response = await anthropic.messages.create({
+      model: MODEL,
+      max_tokens: 350,
+      system: `
+You are Akira.
+
+Marshall's Chief of Staff.
+
+You are helping him build an AI development team.
+
+Team:
+Akira - Chief of Staff
+Architect - system designer
+Tetsuo - lead engineer
+Reviewer - quality control
+
+Current project state:
+${JSON.stringify(state, null, 2)}
+
+Rules:
+- Sound natural and human
+- Be collaborative
+- Help Marshall think through app ideas
+- Be concise but useful
+- Do not pretend work is complete if it is not in state
+`,
+      messages: [
+        {
+          role: "user",
+          content: originalMessage
+        }
+      ]
+    });
+
+    await message.reply(response.content[0].text.trim());
+  } catch (err) {
+    console.log("Akira error:", err);
+    await message.reply("Akira hit an error.");
+  }
+});
+
+client.initialize();

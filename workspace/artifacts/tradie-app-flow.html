@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Tradie Job & Invoice Tracking App Flow</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 24px;
+      font-family: Arial, Helvetica, sans-serif;
+      background: #0b0f14;
+      color: #e5e7eb;
+    }
+    h1 {
+      margin: 0 0 16px 0;
+      font-size: 22px;
+    }
+    .card {
+      background: #111827;
+      border: 1px solid #1f2937;
+      border-radius: 14px;
+      padding: 20px;
+    }
+    .mermaid {
+      background: white;
+      border-radius: 12px;
+      padding: 16px;
+      overflow: auto;
+    }
+  </style>
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    window.mermaid = mermaid;
+    mermaid.initialize({ startOnLoad: true, securityLevel: 'loose' });
+  </script>
+</head>
+<body>
+  <h1>Tradie Job & Invoice Tracking App Flow</h1>
+  <div class="card">
+    <div class="mermaid">
+flowchart TD
+    A[Tradie Opens App] --> B[View Dashboard]
+    B --> C{Choose Action}
+    C -->|New Job| D[Create Job Quote]
+    C -->|Track Work| E[Log Hours & Materials]
+    C -->|Send Invoice| F[Generate Invoice]
+    C -->|Check Payments| G[View Payment Status]
+    
+    D --> D1[Enter Client Info]
+    D1 --> D2[Add Services & Pricing]
+    D2 --> D3[Send Quote to Client]
+    D3 --> D4[Quote Accepted?]
+    D4 -->|Yes| H[Job Active]
+    D4 -->|No| B
+    
+    E --> E1[Record Work Completed]
+    E1 --> E2[Add Material Costs]
+    E2 --> E3[Update Job Status]
+    E3 --> H
+    
+    H --> F
+    F --> F1[Auto-Generate Invoice]
+    F1 --> F2[Review & Customize]
+    F2 --> F3[Send to Client]
+    F3 --> F4[Invoice Sent]
+    
+    G --> G1[View Invoice Status]
+    G1 --> G2[Track Payments Received]
+    G2 --> G3[Overdue Alerts]
+    G3 --> G4[Send Reminders]
+    G4 --> G5[Mark as Paid]
+    
+    F4 --> I[Job Complete]
+    G5 --> I
+    I --> J[Archived in Records]
+    J --> B
+    </div>
+  </div>
+</body>
+</html>
