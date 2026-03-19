@@ -1,0 +1,25 @@
+# secrets
+.env
+
+# runtime auth/cache
+.wwebjs_auth/
+.wwebjs_cache/
+
+# docker/runtime logs
+boot-error.log
+*.log
+
+# node
+node_modules/
+
+# generated artifacts
+workspace/artifacts/
+workspace/incoming-media/
+
+# local state
+conversation-memory.json
+project-state.json
+workspace/execution-state.json
+workspace/build-manifest.json
+workspace/caloritrack/build-manifest.json
+workspace/calorytracker/build-manifest.json

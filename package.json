@@ -12,6 +12,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",
     "axios": "^1.13.6",
+    "dotenv": "^17.3.1",
     "imap-simple": "^5.1.0",
     "mailparser": "^3.9.4",
     "qrcode-terminal": "^0.12.0",

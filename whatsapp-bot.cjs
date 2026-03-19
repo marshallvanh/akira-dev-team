@@ -4,77 +4,61 @@ const fs = require("fs");
 const path = require("path");
 
 const akira = require("./akira-core.cjs");
-const tetsuo = require("./tetsuo-worker.cjs");
-const backendWorker = require("./backend-worker.cjs");
-const frontendWorker = require("./frontend-worker.cjs");
-const architect = require("./architect-worker.cjs");
-const reviewer = require("./reviewer-worker.cjs");
-const researchWorker = require("./research-worker.cjs");
-const cto = require("./cto-agent.cjs");
-const brainstormEngine = require("./brainstorm-engine.cjs");
-const artifactEngine = require("./artifact-engine.cjs");
 const conversationMemory = require("./conversation-memory.cjs");
-const mediaMemory = require("./media-memory.cjs");
-const { detectResetIntent, resetProjectState } = require("./project-reset.cjs");
+const visionHelper = require("./vision-helper.cjs");
 const { safeClaudeCall } = require("./safe-claude.cjs");
-const { decideIntent } = require("./intelligence-layer.cjs");
+const { detectPresenceMode } = require("./presence-layer.cjs");
+const researchWorker = require("./research-worker.cjs");
+const artifactEngine = require("./artifact-engine.cjs");
+const executionEngine = require("./execution-engine.cjs");
 
 const client = new Client({
   authStrategy: new LocalAuth({
     clientId: "akira-chief-of-staff",
+    dataPath: path.join(__dirname, ".wwebjs_auth"),
   }),
   puppeteer: {
     headless: true,
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium",
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage"
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--no-first-run",
+      "--no-zygote",
+      "--single-process",
+      "--disable-extensions",
+      "--disable-background-networking",
+      "--disable-sync",
+      "--metrics-recording-only",
+      "--mute-audio"
     ],
   },
 });
 
 const WORKSPACE = path.join(__dirname, "workspace");
 const MANIFEST_FILE = path.join(WORKSPACE, "build-manifest.json");
-const AUTO_TASK_LIMIT = 3;
-
-const DISPLAY_NAMES = {
-  "Akira": "Akira",
-  "CTO": "Kaneda",
-  "Research Worker": "Lucy",
-  "Backend Worker": "Tetsuo",
-  "Frontend Worker": "Rebecca",
-  "QA Tester": "Kiwi",
-  "Reviewer": "Kiwi",
-  "Architect": "Kei",
-  "Tetsuo": "Tetsuo"
-};
-
-function displayName(name) {
-  return DISPLAY_NAMES[name] || name;
-}
 
 function normalized(text) {
   return String(text || "").trim().toLowerCase();
 }
 
-function shortText(text, max = 180) {
-  const value = String(text || "").replace(/\s+/g, " ").trim();
-  if (!value) return "";
+function shortText(text, max = 3500) {
+  let value = String(text || "").trim();
+  value = value.replace(/(\d+\.)\s/g, "\n$1 ");
+  value = value.replace(/\. /g, ".\n");
+  value = value.replace(/\n{3,}/g, "\n\n");
+  value = value.trim();
+
   if (value.length <= max) return value;
   return value.slice(0, max - 3).trim() + "...";
-}
-
-function bulletList(items, maxItems = 3, maxItemLength = 120) {
-  if (!Array.isArray(items) || items.length === 0) return "None";
-  return items
-    .slice(0, maxItems)
-    .map((item) => `- ${shortText(item, maxItemLength)}`)
-    .join("\n");
 }
 
 function formatProjectState() {
   const state = akira.getState();
   const activeIdea = conversationMemory.getActiveIdea();
+  const activeProject = executionEngine.getActiveProject();
 
   return [
     `Project: ${state.project_name || "Not started"}`,
@@ -85,475 +69,266 @@ function formatProjectState() {
     `Current focus: ${state.current_focus || "None"}`,
     `Next action: ${state.next_action || "None"}`,
     `Active idea: ${activeIdea.idea || "None"}`,
+    `Execution project: ${activeProject ? activeProject.name : "None"}`,
     `Open tasks: ${Array.isArray(state.tasks) ? state.tasks.length : 0}`,
     `Completed tasks: ${Array.isArray(state.completed_tasks) ? state.completed_tasks.length : 0}`,
     `Blocked tasks: ${Array.isArray(state.blocked_tasks) ? state.blocked_tasks.length : 0}`
   ].join("\n");
 }
 
-function extractReviewSummaryFromDescription(description) {
-  const text = String(description || "");
-  const match = text.match(/Review summary:\s*([\s\S]*?)(?:\n\nRequired changes:|\nRequired changes:|$)/i);
-  return match ? shortText(match[1], 180) : "";
-}
-
-function extractRequiredChanges(description) {
-  const text = String(description || "");
-  const match = text.match(/Required changes:\s*([\s\S]*?)$/i);
-
-  if (!match) return [];
-
-  return match[1]
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => line.replace(/^-+\s*/, ""))
-    .map((line) => line.replace(/^•\s*/, ""))
-    .filter(Boolean);
-}
-
-function formatCompactTask(task) {
-  const changes = extractRequiredChanges(task.description);
-  const summary = extractReviewSummaryFromDescription(task.description);
-  const keyIssue = changes.length > 0 ? shortText(changes[0], 120) : "No key issue recorded";
-  const nextStep = shortText(task.deliverable || "Continue working this task", 140);
-
-  return [
-    `${task.id} — ${task.title}`,
-    `Status: Open`,
-    `Summary: ${summary || "Task is waiting for execution."}`,
-    `Key issue: ${keyIssue}`,
-    `Next step: ${nextStep}`
-  ].join("\n");
-}
-
-function formatCompactCompletedTask(task) {
-  return [
-    `${task.id} — ${task.title}`,
-    `Status: Completed`,
-    `Deliverable: ${shortText(task.deliverable || "No deliverable", 140)}`
-  ].join("\n");
-}
-
-function formatCompactBlockedTask(task) {
-  return [
-    `${task.id} — ${task.title}`,
-    `Status: Blocked`,
-    `Reason: ${shortText(task.block_reason || "Blocked", 160)}`
-  ].join("\n");
-}
-
 function formatDevStatus() {
   const state = akira.getState();
-
   const openTasks = Array.isArray(state.tasks) ? state.tasks : [];
   const completedTasks = Array.isArray(state.completed_tasks) ? state.completed_tasks : [];
   const blockedTasks = Array.isArray(state.blocked_tasks) ? state.blocked_tasks : [];
-  const sortedOpen = cto.sortTasksForExecution(openTasks);
-
-  if (openTasks.length === 0 && completedTasks.length === 0 && blockedTasks.length === 0) {
-    return "No dev work tracked yet.";
-  }
 
   let reply = "Dev Team Status\n\n";
+  reply += `Open tasks: ${openTasks.length}\n`;
+  reply += `Completed tasks: ${completedTasks.length}\n`;
+  reply += `Blocked tasks: ${blockedTasks.length}\n`;
 
-  if (sortedOpen.length > 0) {
-    reply += "Open Tasks\n";
-    reply += sortedOpen.slice(0, 6).map(formatCompactTask).join("\n\n");
-    reply += "\n\n";
-  }
-
-  if (blockedTasks.length > 0) {
-    reply += "Blocked Tasks\n";
-    reply += blockedTasks.slice(-4).reverse().map(formatCompactBlockedTask).join("\n\n");
-    reply += "\n\n";
-  }
-
-  if (completedTasks.length > 0) {
-    reply += "Recently Completed\n";
-    reply += completedTasks.slice(-4).reverse().map(formatCompactCompletedTask).join("\n\n");
+  if (openTasks.length > 0) {
+    reply += `\nCurrent open:\n`;
+    reply += openTasks.slice(0, 5).map((task) => `${task.id} — ${task.title}`).join("\n");
   }
 
   return reply.trim();
 }
 
-function formatWorkerReports() {
-  const reports = akira.getWorkerReports();
-
-  if (!Array.isArray(reports) || reports.length === 0) {
-    return "No worker reports yet.";
-  }
-
-  return (
-    "Worker Reports\n\n" +
-    reports
-      .slice(-5)
-      .reverse()
-      .map((report) => {
-        const worker = displayName(report.worker || "Worker");
-        return `${report.task_id} — ${worker}\n${shortText(report.report, 500)}`;
-      })
-      .join("\n\n")
-  );
-}
-
-function formatReviews() {
-  const reviews = akira.getReviews();
-
-  if (!Array.isArray(reviews) || reviews.length === 0) {
-    return "No reviews yet.";
-  }
-
-  return (
-    "Review Reports\n\n" +
-    reviews
-      .slice(-5)
-      .reverse()
-      .map((review) => {
-        return (
-          `${review.task_id}\n` +
-          `Decision: ${review.decision}\n` +
-          `Summary: ${shortText(review.summary, 220)}\n` +
-          `Issues:\n${bulletList(review.issues, 3, 120)}\n` +
-          `Next action: ${shortText(review.next_action, 180)}`
-        );
-      })
-      .join("\n\n")
-  );
-}
-
-function formatManifest() {
+function formatBuildFiles() {
   if (!fs.existsSync(MANIFEST_FILE)) {
-    return "No build files yet.";
+    return "No build files tracked yet.";
   }
 
   try {
     const manifest = JSON.parse(fs.readFileSync(MANIFEST_FILE, "utf8"));
-
     if (!Array.isArray(manifest.files) || manifest.files.length === 0) {
-      return "No build files yet.";
+      return "No build files tracked yet.";
     }
 
-    return (
-      "Build Files\n\n" +
-      manifest.files
-        .slice(-20)
-        .map((file) => file.path)
-        .join("\n")
-    );
+    return "Build Files\n\n" + manifest.files.slice(-20).map((file) => file.path).join("\n");
   } catch {
     return "Could not read build manifest.";
   }
 }
 
-function isBuildConfirmation(text, state) {
-  const value = normalized(text);
-  if (!state || !state.draft_project_idea) return false;
-
-  const phrases = [
-    "ok build it",
-    "okay build it",
-    "build it",
-    "lets build it",
-    "let's build it",
-    "turn that into a project",
-    "turn it into a project",
-    "go ahead and build it",
-    "yes build it",
-    "start the project",
-    "create the project"
-  ];
-
-  return phrases.includes(value);
-}
-
-function isDirectStatusCommand(text) {
+function isDirectCommand(text) {
   const value = normalized(text);
 
   return {
     projectState: ["project state", "state", "akira state"].includes(value),
     devStatus: ["dev status", "akira dev status"].includes(value),
-    reports: ["reports", "tetsuo reports", "worker reports"].includes(value),
-    reviews: ["reviews", "review reports"].includes(value),
     buildFiles: ["build files", "what files have been built"].includes(value),
-    reviewLatest: ["review latest", "review the latest work"].includes(value),
-    ctoRun: ["cto run", "cto", "cto next"].includes(value)
+    activeProject: ["active project", "project plan", "current project"].includes(value),
+    approveStage: ["approve", "approve stage", "continue project", "move to next stage"].includes(value),
+    forgetIdea: [
+      "forget this idea",
+      "delete this idea",
+      "clear active idea",
+      "forget the idea",
+      "remove active idea"
+    ].includes(value),
+    forgetEverything: [
+      "forget everything",
+      "clear all memory",
+      "delete all memory",
+      "wipe memory",
+      "forget our conversation",
+      "let's forget everything we had conversed about"
+    ].includes(value)
   };
+}
+
+function looksLikeIdeaMessage(text) {
+  const value = normalized(text);
+  return [
+    "i want to build",
+    "i'm thinking of building",
+    "im thinking of building",
+    "let's build",
+    "lets build",
+    "app idea",
+    "what about an app",
+    "for tradies",
+    "for sole traders",
+    "for small business"
+  ].some((phrase) => value.includes(phrase));
+}
+
+function looksLikeIdeaFollowup(text, hasIdea) {
+  if (!hasIdea) return false;
+  const value = normalized(text);
+
+  return [
+    "what about",
+    "what if",
+    "could it",
+    "should it",
+    "how would",
+    "how could",
+    "would it need",
+    "what features",
+    "what pages",
+    "what screens",
+    "what workflow",
+    "for solo",
+    "for teams",
+    "for staff",
+    "for customers"
+  ].some((phrase) => value.includes(phrase));
+}
+
+function looksLikePointFollowup(text) {
+  const value = normalized(text);
+  return (
+    /^expand\s+\d+/.test(value) ||
+    /^point\s+\d+/.test(value) ||
+    /^tell me more about\s+\d+/.test(value) ||
+    /^explain\s+\d+/.test(value) ||
+    /^compare\s+\d+\s+(and|vs)\s+\d+/.test(value) ||
+    (value.includes("turn ") && value.includes(" into an mvp"))
+  );
+}
+
+function looksLikeResearchCommand(text) {
+  const value = normalized(text);
+  return value.startsWith("research ") || value.startsWith("look up ") || value.startsWith("investigate ");
+}
+
+function looksLikeArtifactCommand(text) {
+  const value = normalized(text);
+  return (
+    value.includes("flowchart") ||
+    value.includes("flow chart") ||
+    value.includes("workflow") ||
+    value.includes("diagram") ||
+    value.includes("roadmap") ||
+    value.includes("wireframe") ||
+    value.includes("architecture")
+  );
+}
+
+function looksLikeExecutionCommand(text) {
+  const value = normalized(text);
+  return value.startsWith("build ") || value.startsWith("start project ");
 }
 
 function extractResearchQuery(text) {
-  const value = String(text || "").trim();
-
-  return value
-    .replace(/^research\s+/i, "")
-    .replace(/^look up\s+/i, "")
-    .replace(/^investigate\s+/i, "")
-    .replace(/^researcher\s+/i, "")
-    .trim();
+  return String(text || "").trim().replace(/^research\s+/i, "").replace(/^look up\s+/i, "").replace(/^investigate\s+/i, "").trim();
 }
 
-function refersToRecentImage(text) {
-  const value = normalized(text);
+function getStyleGuide(presenceMode, userMessage, hasActiveIdea) {
+  const text = normalized(userMessage);
+  const ideaMode =
+    text.includes("feature") ||
+    text.includes("what should it have") ||
+    looksLikeIdeaMessage(text) ||
+    looksLikeIdeaFollowup(text, hasActiveIdea) ||
+    looksLikePointFollowup(text);
 
-  return (
-    value.includes("image") ||
-    value.includes("photo") ||
-    value.includes("picture") ||
-    value.includes("uploaded") ||
-    value.includes("can you see this") ||
-    value.includes("can you see the image") ||
-    value.includes("what do you think this is") ||
-    value.includes("is this the leak") ||
-    value.includes("look at this")
-  );
-}
+  if (ideaMode) {
+    return `
+Reply in POINT MODE.
 
-async function analyzeImageWithAkira(userText, imageInfo, state, activeIdea) {
-  if (!imageInfo || !imageInfo.path || !fs.existsSync(imageInfo.path)) {
-    return {
-      ok: false,
-      error: "I couldn't find a recent image to inspect."
-    };
+Use this exact layout.
+
+Quick take
+One short sentence.
+
+Key points
+1. Short idea.
+2. Short idea.
+3. Short idea.
+4. Short idea.
+5. Short idea.
+
+Best starting point
+One short sentence.
+
+You can ask
+expand 1
+expand 2
+expand 3
+compare 1 and 2
+turn a point into MVP
+
+Rules
+• Each numbered point must be under 10 words
+• One idea per line
+• No explanations inside numbered points
+• No paragraphs inside the list
+• Use simple language
+• Write for WhatsApp readability
+• Be direct and concise
+`;
   }
 
-  const base64 = fs.readFileSync(imageInfo.path, { encoding: "base64" });
+  if (presenceMode === "advisor") {
+    return `
+Reply in a scan-friendly structure.
 
-  const response = await safeClaudeCall({
-    max_tokens: 450,
-    system: `
-You are Akira.
+Format:
+Quick take:
+1 sentence only.
 
-Marshall's Chief of Staff.
+Top points:
+1. One short sentence.
+2. One short sentence.
+3. One short sentence.
 
-You are helping inspect an uploaded image.
+Recommendation:
+1 sentence only.
 
-Current project state:
-${JSON.stringify({
-  project_name: state.project_name || "",
-  milestone: state.milestone || "",
-  current_focus: state.current_focus || "",
-  next_action: state.next_action || "",
-  open_tasks: Array.isArray(state.tasks) ? state.tasks.length : 0
-}, null, 2)}
-
-Current active idea:
-${activeIdea.idea || "None"}
+Follow-up options:
+- Expand 1-3
+- Compare points
+- Ask for examples
 
 Rules:
-- Answer naturally and conversationally
-- Be specific about what you can see
-- If the image suggests a vehicle/mechanical issue, mention likely causes and sensible next checks
-- If uncertain, say what is visible and what would confirm it
-- Do not pretend certainty if the image is ambiguous
-`,
-    messages: [
-      {
-        role: "user",
-        content: [
-          {
-            type: "image",
-            source: {
-              type: "base64",
-              media_type: imageInfo.mimetype || "image/jpeg",
-              data: base64
-            }
-          },
-          {
-            type: "text",
-            text: userText || "Please inspect this image and tell me what you can see."
-          }
-        ]
-      }
-    ]
-  });
-
-  if (!response.ok) {
-    return {
-      ok: false,
-      error: response.error || "Image analysis failed."
-    };
+- Keep every point short
+- No large paragraphs
+- Easy to read on a phone
+`;
   }
 
-  return {
-    ok: true,
-    reply: String(response.text || "").trim()
-  };
+  return `
+Reply naturally but neatly.
+Use short paragraphs.
+Keep it easy to scan in WhatsApp.
+`;
 }
 
-function getTaskWorker(task) {
-  const workerName = cto.chooseWorker(task);
+async function handleImageQuestion(message, questionText) {
+  const lastImage = visionHelper.getLastImage();
 
-  switch (workerName) {
-    case "Research Worker":
-      return { label: "Research Worker", runner: researchWorker, type: "research" };
-    case "Frontend Worker":
-      return { label: "Frontend Worker", runner: frontendWorker, type: "build" };
-    case "Backend Worker":
-      return { label: "Backend Worker", runner: backendWorker, type: "build" };
-    case "QA Tester":
-      return { label: "QA Tester", runner: null, type: "qa" };
-    default:
-      return { label: "Tetsuo", runner: tetsuo, type: "build" };
-  }
-}
-
-async function runTaskWithAssignedWorker(task) {
-  const assigned = getTaskWorker(task);
-
-  if (assigned.type === "qa") {
-    return {
-      workerLabel: assigned.label,
-      ok: false,
-      taskId: task?.id || "",
-      error: "QA Tester is a review role and should not be used as the primary builder for this task."
-    };
+  if (!lastImage) {
+    const reply = "I don’t currently have an image saved to inspect. Upload the photo again and I’ll take a look.";
+    conversationMemory.addEntry("Akira", reply);
+    await message.reply(reply);
+    return true;
   }
 
-  if (assigned.type === "research") {
-    const query = `${task.title}\n\n${task.description}\n\nDeliverable: ${task.deliverable}`;
-    const researchResult = await researchWorker.runResearch(query);
+  const activeIdea = conversationMemory.getActiveIdea();
+  const recentContext = conversationMemory.getRecentContext(6);
 
-    if (!researchResult.ok) {
-      return {
-        workerLabel: assigned.label,
-        ok: false,
-        taskId: task?.id || "",
-        error: researchResult.error || "Research worker failed"
-      };
-    }
-
-    const output = `[Research Worker]\n\nSUMMARY:\nResearch task completed\n\nIMPLEMENTATION:\n${researchResult.research}\n\nFILES:\nNo files created\n\nNEXT STEP:\nReview findings and continue\n\nBLOCKERS:\nNone`;
-
-    if (typeof akira.addWorkerReport === "function") {
-      akira.addWorkerReport(task.id, output, "Research Worker");
-    }
-
-    if (typeof akira.completeTask === "function") {
-      akira.completeTask(task.id, output);
-    }
-
-    return {
-      workerLabel: assigned.label,
-      ok: true,
-      taskId: task.id,
-      output,
-      files: []
-    };
-  }
-
-  const result = await assigned.runner.runTask(task);
-
-  return {
-    workerLabel: assigned.label,
-    ...result
-  };
-}
-
-async function reviewCompletedTask(result) {
-  const task = akira.getTaskById(result.taskId);
-
-  if (!task) {
-    return null;
-  }
-
-  const review = await reviewer.reviewTask({
-    projectState: akira.getState(),
-    task,
-    report: result.output
-  });
-
-  akira.addReview(task.id, review);
-
-  if (typeof akira.setNextAction === "function") {
-    akira.setNextAction(review.next_action || "Review next task");
-  }
-
-  let revisionTask = null;
-
-  if (
-    String(review.decision).toLowerCase() === "revise" &&
-    typeof akira.createRevisionTask === "function"
-  ) {
-    revisionTask = akira.createRevisionTask(task, review);
-
-    if (typeof akira.setNextAction === "function") {
-      akira.setNextAction(`Revision required for ${task.id} via ${revisionTask.id}`);
-    }
-  }
-
-  return {
-    review,
-    revisionTask
-  };
-}
-
-async function reviewLatestWork() {
-  const reviews = akira.getReviews();
-  const latest = Array.isArray(reviews) ? reviews[reviews.length - 1] : null;
-
-  if (!latest) {
-    return "There’s nothing reviewed yet.";
-  }
-
-  let reply =
-    `Latest review for ${latest.task_id}\n\n` +
-    `Decision: ${latest.decision}\n` +
-    `Summary: ${shortText(latest.summary, 220)}\n` +
-    `Issues:\n${bulletList(latest.issues, 3, 120)}\n` +
-    `Next action: ${shortText(latest.next_action, 180)}`;
-
-  const state = akira.getState();
-  const tasks = Array.isArray(state.tasks) ? state.tasks : [];
-  const revisionTask = tasks.find(
-    (t) =>
-      t.parent_task_id &&
-      String(t.parent_task_id).toLowerCase() === String(latest.task_id).toLowerCase()
+  const result = await visionHelper.analyzeImage(
+    questionText || "Please describe what you can see in this image.",
+    lastImage.path,
+    lastImage.mimeType,
+    recentContext,
+    activeIdea.idea || ""
   );
 
-  if (revisionTask) {
-    reply += `\n\nRevision task created:\n${revisionTask.id} — ${revisionTask.title}`;
+  if (!result.ok) {
+    const reply = result.error || "I couldn't analyze that image just now.";
+    conversationMemory.addEntry("Akira", reply);
+    await message.reply(reply);
+    return true;
   }
 
-  return reply;
-}
-
-function summarizeExecutionForFounder(result, reviewed) {
-  const decision = String(reviewed?.review?.decision || "approve").toLowerCase();
-  const status =
-    decision === "revise"
-      ? "Needs revision"
-      : decision === "approve"
-      ? "Completed"
-      : "In progress";
-
-  const worker = displayName(result.workerLabel);
-  let reply = `${worker} finished ${result.taskId}\n\n`;
-  reply += `Status: ${status}\n`;
-
-  if (Array.isArray(result.files) && result.files.length > 0) {
-    reply += `Created:\n${bulletList(result.files, 4, 90)}\n`;
-  } else {
-    reply += `Created:\n- No files created\n`;
-  }
-
-  if (decision === "revise") {
-    const issues = Array.isArray(reviewed?.review?.issues) ? reviewed.review.issues : [];
-    reply += `Top issues:\n${bulletList(issues, 3, 110)}\n`;
-
-    if (reviewed?.revisionTask) {
-      reply += `Revision queued:\n- ${reviewed.revisionTask.id}\n`;
-    }
-
-    if (reviewed?.review?.next_action) {
-      reply += `Next step:\n${shortText(reviewed.review.next_action, 140)}\n`;
-    }
-  } else if (reviewed?.review?.summary) {
-    reply += `Outcome:\n${shortText(reviewed.review.summary, 180)}\n`;
-  }
-
-  reply += `Founder action:\nNone needed right now`;
-
-  return reply;
+  conversationMemory.addEntry("Akira", result.reply);
+  await message.reply(result.reply);
+  return true;
 }
 
 async function handleResearch(message, originalMessage) {
@@ -566,36 +341,33 @@ async function handleResearch(message, originalMessage) {
     return true;
   }
 
-  await message.reply(`Got it — ${displayName("Research Worker")} is investigating:\n${query}`);
+  await message.reply(`Got it — Lucy is investigating:\n${query}`);
 
   const result = await researchWorker.runResearch(query);
 
   if (!result.ok) {
-    const reply = `${displayName("Research Worker")} couldn't complete that.\nReason: ${result.error}`;
+    const reply = `Lucy couldn't complete that.\nReason: ${result.error || "Unknown error"}`;
     conversationMemory.addEntry("Akira", reply);
     await message.reply(reply);
     return true;
   }
 
-  conversationMemory.addEntry("Akira", result.research);
-  await message.reply(result.research);
+  const reply = shortText(String(result.research || "Research completed."), 4000);
+  conversationMemory.addEntry("Akira", reply);
+  await message.reply(reply);
   return true;
 }
 
 async function sendArtifactFiles(chatId, artifact) {
-  if (!Array.isArray(artifact.absoluteFiles) || artifact.absoluteFiles.length === 0) {
-    return;
-  }
+  if (!Array.isArray(artifact.absoluteFiles) || artifact.absoluteFiles.length === 0) return;
 
   for (const file of artifact.absoluteFiles) {
     if (!fs.existsSync(file)) continue;
 
     try {
-      const ext = path.extname(file).toLowerCase();
       const media = MessageMedia.fromFilePath(file);
-
       await client.sendMessage(chatId, media, {
-        sendMediaAsDocument: ![".png", ".jpg", ".jpeg", ".webp"].includes(ext),
+        sendMediaAsDocument: false,
         caption: path.basename(file)
       });
     } catch (err) {
@@ -608,7 +380,7 @@ async function handleArtifactRequest(message, originalMessage) {
   const activeIdea = conversationMemory.getActiveIdea();
   const contextIdea = activeIdea.idea || "";
 
-  await message.reply(`Akira\nGot it — I’m asking ${displayName("Architect")} to draw that up.`);
+  await message.reply("Got it — Kei is drawing that up.");
 
   const artifact = await artifactEngine.createArtifact(originalMessage, contextIdea);
 
@@ -621,221 +393,64 @@ async function handleArtifactRequest(message, originalMessage) {
 
   await sendArtifactFiles(message.from, artifact);
 
-  const reply =
-    `Akira\n${artifact.summary}\n\nDelivered file:\n${artifact.files.join("\n")}\n\nType:\n${artifact.type}`;
-
+  const reply = `Done.\n\nType: ${artifact.type}\nDelivered: ${Array.isArray(artifact.files) ? artifact.files.join(", ") : "artifact sent"}`;
   conversationMemory.addEntry("Akira", reply);
   await message.reply(reply);
   return true;
 }
 
-async function handleBrainstorm(message, idea) {
-  const activeIdea = conversationMemory.getActiveIdea();
-  const contextIdea = activeIdea.idea || "";
-  const storedIdea = idea || contextIdea;
-
-  if (storedIdea) {
-    conversationMemory.setActiveIdea(storedIdea);
-  }
-
-  const result = await brainstormEngine.brainstorm(idea, contextIdea);
-
-  const reply =
-    `${result.akira}\n\n` +
-    `Quick team take\n` +
-    `${displayName("Research Worker")}: ${result.lucy}\n` +
-    `${displayName("Architect")}: ${result.kei}\n` +
-    `${displayName("CTO")}: ${result.kaneda}\n\n` +
-    `You can keep chatting naturally, say "ok build it", or ask me to create a flowchart, workflow, roadmap, wireframe, or graph.`;
-
-  conversationMemory.addEntry("Akira", reply);
-  await message.reply(reply);
-}
-
-async function handleForgetIdea(message) {
-  const activeIdea = conversationMemory.getActiveIdea();
-
-  if (!activeIdea.idea) {
-    const reply = "Akira\nThere isn’t an active idea stored right now.";
-    conversationMemory.addEntry("Akira", reply);
-    await message.reply(reply);
-    return true;
-  }
-
-  conversationMemory.clearActiveIdea();
-  const reply = `Akira\nDone — I forgot the active idea:\n${activeIdea.idea}`;
+async function handleExecutionRequest(message, originalMessage) {
+  const project = executionEngine.createProject(originalMessage);
+  const reply = executionEngine.formatCompactProject(project);
   conversationMemory.addEntry("Akira", reply);
   await message.reply(reply);
   return true;
 }
 
-async function handleForgetAllMemory(message) {
-  conversationMemory.clearAllMemory();
-  mediaMemory.clearLatestImage();
-  await message.reply("Akira\nDone — I cleared all stored conversation memory.");
-  return true;
-}
-
-async function handleFounderReset(message, originalMessage) {
-  const intent = detectResetIntent(originalMessage);
-
-  if (!intent) {
-    return false;
-  }
-
-  const result = resetProjectState(intent);
-  const reply = `Akira: ${result.message}`;
-  conversationMemory.addEntry("Akira", reply);
-  await message.reply(reply);
-  return true;
-}
-
-async function handleCtoRun(message) {
-  const step = cto.getNextExecutionStep();
-
-  if (step.action === "idle") {
-    const reply = step.message;
-    conversationMemory.addEntry("Akira", reply);
-    await message.reply(reply);
-    return true;
-  }
-
-  const task = step.task;
-
-  await message.reply(
-`${displayName("CTO")} executing task
-
-Task:
-${task.id} — ${task.title}
-
-Assigned Worker:
-${displayName(step.worker)}`
-  );
-
-  const assigned = getTaskWorker(task);
-
-  if (assigned.type === "qa") {
-    const reply =
-`${displayName("CTO")} paused execution
-
-Reason:
-${displayName(step.worker)} is a review role, not a build worker.`;
-    conversationMemory.addEntry("Akira", reply);
-    await message.reply(reply);
-    return true;
-  }
-
-  const result = await runTaskWithAssignedWorker(task);
+async function handleApprovalRequest(message) {
+  const result = executionEngine.approveCurrentStage();
 
   if (!result.ok) {
-    const reply =
-`${displayName(assigned.label)} couldn't complete ${task.id}
-
-Reason:
-${result.error}`;
-    conversationMemory.addEntry("Akira", reply);
-    await message.reply(reply);
+    await message.reply(result.error || "Could not approve current stage.");
     return true;
   }
 
-  const reviewed = await reviewCompletedTask(result);
-  const reply = summarizeExecutionForFounder(result, reviewed);
+  const lines = [];
+  lines.push(`Approved: ${result.approvedStage.title}`);
+
+  if (result.nextStage) {
+    lines.push(`Next stage: ${result.nextStage.title}`);
+    lines.push(`Owner: ${result.nextStage.owner}`);
+    lines.push(`Deliverable: ${result.nextStage.deliverable}`);
+  } else {
+    lines.push("Project has no more stages.");
+  }
+
+  const reply = lines.join("\n");
   conversationMemory.addEntry("Akira", reply);
   await message.reply(reply);
   return true;
-}
-
-async function handleDirectTaskRun(message, originalMessage) {
-  if (!normalized(originalMessage).startsWith("run task ")) {
-    return false;
-  }
-
-  const taskId = originalMessage.slice("run task ".length).trim();
-  const task = akira.getTaskById(taskId);
-
-  if (!task) {
-    const reply = `I couldn't find ${taskId}.`;
-    conversationMemory.addEntry("Akira", reply);
-    await message.reply(reply);
-    return true;
-  }
-
-  if (task.status !== "pending") {
-    const reply = `${task.id} is not pending. Current status: ${task.status}`;
-    conversationMemory.addEntry("Akira", reply);
-    await message.reply(reply);
-    return true;
-  }
-
-  const assigned = getTaskWorker(task);
-
-  if (assigned.type === "qa") {
-    const reply = `${displayName(assigned.label)} is a review role and can't be used as the primary builder for ${task.id}.`;
-    conversationMemory.addEntry("Akira", reply);
-    await message.reply(reply);
-    return true;
-  }
-
-  await message.reply(`Got it — ${displayName(assigned.label)} is starting ${task.id}.`);
-
-  const result = await runTaskWithAssignedWorker(task);
-
-  if (!result.ok) {
-    const reply = `${displayName(result.workerLabel)} couldn't complete ${task.id}.\nReason: ${result.error}`;
-    conversationMemory.addEntry("Akira", reply);
-    await message.reply(reply);
-    return true;
-  }
-
-  const reviewed = await reviewCompletedTask(result);
-  const reply = summarizeExecutionForFounder(result, reviewed);
-  conversationMemory.addEntry("Akira", reply);
-  await message.reply(reply);
-  return true;
-}
-
-async function handleBuildProject(message, idea) {
-  await message.reply(`Got it — I’m getting ${displayName("Architect")} to turn that into a proper project plan.`);
-
-  const plan = await architect.createPlan(idea);
-
-  akira.startProject(plan);
-
-  const createdTasks = [];
-  for (const taskInput of plan.tasks) {
-    const task = akira.createTask(taskInput);
-    createdTasks.push(task);
-  }
-
-  const reply =
-    `Project created\n\n` +
-    `Name: ${plan.project_name}\n` +
-    `Summary: ${plan.project_summary}\n` +
-    `Target user: ${plan.target_user}\n` +
-    `Milestone: ${plan.milestone}\n\n` +
-    `Tasks\n\n` +
-    createdTasks
-      .map(
-        (task) =>
-          `${task.id} — ${task.title}\nDescription: ${task.description || "No description"}\nDeliverable: ${task.deliverable || "No deliverable"}`
-      )
-      .join("\n\n");
-
-  conversationMemory.addEntry("Akira", reply);
-  await message.reply(reply);
 }
 
 client.on("qr", (qr) => {
-  console.log("\nScan the QR code below with WhatsApp\n");
+  console.log("QR RECEIVED");
   qrcode.generate(qr, { small: true });
+});
+
+client.on("authenticated", () => {
+  console.log("WhatsApp authenticated");
+});
+
+client.on("auth_failure", (msg) => {
+  console.log("Auth failure:", msg);
 });
 
 client.on("ready", () => {
   console.log("Akira Dev Team Core is online");
 });
 
-client.on("authenticated", () => {
-  console.log("WhatsApp authenticated");
+client.on("disconnected", (reason) => {
+  console.log("WhatsApp disconnected:", reason);
 });
 
 client.on("message", async (message) => {
@@ -844,108 +459,57 @@ client.on("message", async (message) => {
 
     const originalMessage = String(message.body || "").trim();
 
-    const state = akira.getState();
-    const activeIdea = conversationMemory.getActiveIdea();
-
-    let downloadedMedia = null;
-
     if (message.hasMedia) {
-      try {
-        downloadedMedia = await message.downloadMedia();
+      const capture = await visionHelper.captureIncomingImage(message);
 
-        if (downloadedMedia && String(downloadedMedia.mimetype || "").startsWith("image/")) {
-          mediaMemory.saveLatestImage(downloadedMedia);
+      if (capture.ok) {
+        conversationMemory.addEntry("Marshall", originalMessage || "[Image uploaded]");
+
+        if (visionHelper.shouldAnalyzeImmediately(originalMessage)) {
+          await handleImageQuestion(message, originalMessage);
+          return;
         }
-      } catch (err) {
-        console.log("Media download error:", err.message || err);
+
+        const reply = "I’ve got the image. Ask me what you want checked, and I’ll inspect it.";
+        conversationMemory.addEntry("Akira", reply);
+        await message.reply(reply);
+        return;
       }
     }
 
-    if (originalMessage) {
-      akira.saveMemory(originalMessage);
-      conversationMemory.addEntry("Marshall", originalMessage);
-    } else if (downloadedMedia && String(downloadedMedia.mimetype || "").startsWith("image/")) {
-      conversationMemory.addEntry("Marshall", "[Uploaded image]");
-    }
+    if (!originalMessage) return;
 
-    if (await handleFounderReset(message, originalMessage)) {
-      return;
-    }
+    akira.saveMemory(originalMessage);
+    conversationMemory.addEntry("Marshall", originalMessage);
 
-    if (downloadedMedia && String(downloadedMedia.mimetype || "").startsWith("image/")) {
-      const latestImage = mediaMemory.getLatestImage();
-      const imagePrompt = originalMessage || "Please inspect this image and tell me what you can see.";
+    const direct = isDirectCommand(originalMessage);
 
-      const inspected = await analyzeImageWithAkira(imagePrompt, latestImage, state, activeIdea);
+    if (direct.forgetIdea) {
+      const activeIdea = conversationMemory.getActiveIdea();
 
-      if (!inspected.ok) {
-        const reply = inspected.error || "I couldn't inspect that image properly.";
+      if (!activeIdea.idea) {
+        const reply = "Akira\nThere isn’t an active idea stored right now.";
         conversationMemory.addEntry("Akira", reply);
         await message.reply(reply);
         return;
       }
 
-      conversationMemory.addEntry("Akira", inspected.reply);
-      await message.reply(inspected.reply);
-      return;
-    }
-
-    if (!originalMessage) {
-      return;
-    }
-
-    const smartIntent = decideIntent(originalMessage, {
-      hasActiveIdea: Boolean(activeIdea.idea)
-    });
-
-    const direct = isDirectStatusCommand(originalMessage);
-
-    if (smartIntent.intent === "forget_idea") {
-      await handleForgetIdea(message);
-      return;
-    }
-
-    if (smartIntent.intent === "forget_all_memory") {
-      await handleForgetAllMemory(message);
-      return;
-    }
-
-    if (smartIntent.intent === "normalize_tasks") {
-      const renamed = akira.normalizeBacklog();
-
-      const reply = renamed.length === 0
-        ? "Backlog already clean."
-        : "Backlog normalized\n\n" + renamed.join("\n");
-
+      conversationMemory.clearActiveIdea();
+      const reply = `Akira\nDone — I forgot the active idea:\n${activeIdea.idea}`;
       conversationMemory.addEntry("Akira", reply);
       await message.reply(reply);
       return;
     }
 
-    if (smartIntent.intent === "cleanup_backlog") {
-      const archived = akira.cleanupBacklog();
-
-      const reply = archived.length === 0
-        ? "Backlog cleanup complete.\n\nNo stale fix tasks were archived."
-        : "Backlog cleanup complete\n\nArchived tasks:\n" + archived.join("\n");
-
-      conversationMemory.addEntry("Akira", reply);
-      await message.reply(reply);
+    if (direct.forgetEverything) {
+      conversationMemory.clearAllMemory();
+      visionHelper.clearLastImage();
+      await message.reply("Got it, fresh start! 👋\n\nWhat can I do for you?");
       return;
     }
 
-    if (direct.ctoRun) {
-      await handleCtoRun(message);
-      return;
-    }
-
-    if (smartIntent.intent === "artifact") {
-      await handleArtifactRequest(message, originalMessage);
-      return;
-    }
-
-    if (smartIntent.intent === "research") {
-      await handleResearch(message, originalMessage);
+    if (visionHelper.looksLikeImageQuestion(originalMessage)) {
+      await handleImageQuestion(message, originalMessage);
       return;
     }
 
@@ -963,99 +527,72 @@ client.on("message", async (message) => {
       return;
     }
 
-    if (direct.reports) {
-      const reply = formatWorkerReports();
-      conversationMemory.addEntry("Akira", reply);
-      await message.reply(reply);
-      return;
-    }
-
-    if (direct.reviews) {
-      const reply = formatReviews();
-      conversationMemory.addEntry("Akira", reply);
-      await message.reply(reply);
-      return;
-    }
-
     if (direct.buildFiles) {
-      const reply = formatManifest();
+      const reply = formatBuildFiles();
       conversationMemory.addEntry("Akira", reply);
       await message.reply(reply);
       return;
     }
 
-    if (direct.reviewLatest) {
-      const reply = await reviewLatestWork();
+    if (direct.activeProject) {
+      const reply = executionEngine.formatProject(executionEngine.getActiveProject());
       conversationMemory.addEntry("Akira", reply);
       await message.reply(reply);
       return;
     }
 
-    if (await handleDirectTaskRun(message, originalMessage)) {
+    if (direct.approveStage) {
+      await handleApprovalRequest(message);
       return;
     }
 
-    if (smartIntent.intent === "build_project" || isBuildConfirmation(originalMessage, state)) {
-      const idea = state.draft_project_idea || activeIdea.idea || originalMessage;
-      await handleBuildProject(message, idea);
+    if (looksLikeExecutionCommand(originalMessage)) {
+      await handleExecutionRequest(message, originalMessage);
       return;
     }
 
-    if (smartIntent.intent === "brainstorm_project") {
-      const mergedIdea = activeIdea.idea
-        ? `${activeIdea.idea}\n${originalMessage}`
-        : originalMessage;
+    if (looksLikeResearchCommand(originalMessage)) {
+      await handleResearch(message, originalMessage);
+      return;
+    }
 
+    if (looksLikeArtifactCommand(originalMessage)) {
+      await handleArtifactRequest(message, originalMessage);
+      return;
+    }
+
+    const activeIdea = conversationMemory.getActiveIdea();
+    const hasActiveIdea = Boolean(activeIdea.idea);
+    const presence = detectPresenceMode(originalMessage, { hasActiveIdea });
+
+    if (looksLikeIdeaMessage(originalMessage) || looksLikeIdeaFollowup(originalMessage, hasActiveIdea)) {
+      const mergedIdea = activeIdea.idea ? `${activeIdea.idea}\n${originalMessage}` : originalMessage;
       conversationMemory.setActiveIdea(mergedIdea);
-      await handleBrainstorm(message, originalMessage);
-      return;
-    }
-
-    if (refersToRecentImage(originalMessage)) {
-      const latestImage = mediaMemory.getLatestImage();
-
-      if (latestImage) {
-        const inspected = await analyzeImageWithAkira(originalMessage, latestImage, state, activeIdea);
-
-        if (!inspected.ok) {
-          const reply = inspected.error || "I couldn't inspect the recent image.";
-          conversationMemory.addEntry("Akira", reply);
-          await message.reply(reply);
-          return;
-        }
-
-        conversationMemory.addEntry("Akira", inspected.reply);
-        await message.reply(inspected.reply);
-        return;
-      }
     }
 
     const recentContext = conversationMemory.getRecentContext(6);
+    const state = akira.getState();
+    const activeProject = executionEngine.getActiveProject();
+    const styleGuide = getStyleGuide(presence.mode, originalMessage, hasActiveIdea);
 
     const response = await safeClaudeCall({
-      max_tokens: 350,
+      max_tokens: presence.mode === "advisor" ? 420 : 320,
       system: `
 You are Akira.
-
 Marshall's Chief of Staff.
 
-You should feel like a normal chatbot first:
+Your style:
 - natural
 - conversational
-- helpful
 - practical
 - warm
+- clear
 
-But you are also aware that you are part of Marshall's AI dev team.
+Current presence mode:
+${presence.mode}
 
-Display names:
-- Akira = Chief of Staff
-- Kaneda = CTO
-- Lucy = Research Worker
-- Tetsuo = Backend Worker
-- Rebecca = Frontend Worker
-- Kiwi = QA Tester / Reviewer
-- Kei = Architect
+Current execution project:
+${activeProject ? executionEngine.formatCompactProject(activeProject) : "None"}
 
 Current project state:
 ${JSON.stringify({
@@ -1072,20 +609,18 @@ ${activeIdea.idea || "None"}
 Recent conversation memory:
 ${recentContext || "None"}
 
+Response style instructions:
+${styleGuide}
+
 Rules:
-- Converse naturally like a normal chatbot
-- Do not force build mode unless Marshall clearly asks
-- Keep continuity with prior conversation when relevant
-- You can help with apps, cars, troubleshooting, research, planning, or general questions
-- If relevant, remember the active app idea naturally
-- Do not pretend work is complete if it is not in state
+- Chat naturally like a smart human
+- Keep continuity with prior conversation
+- Help with apps, business ideas, cars, troubleshooting, planning, and daily questions
+- Make replies easy to scan
+- If there is an active execution project, stay aware of it
+- Do not create tasks or pretend files were implemented unless explicitly done
 `,
-      messages: [
-        {
-          role: "user",
-          content: originalMessage
-        }
-      ]
+      messages: [{ role: "user", content: originalMessage }]
     });
 
     if (!response.ok) {
@@ -1093,13 +628,23 @@ Rules:
       return;
     }
 
-    const reply = String(response.text || "Got it.").trim();
+    const reply = shortText(String(response.text || "Got it.").trim(), 4000);
     conversationMemory.addEntry("Akira", reply);
     await message.reply(reply);
   } catch (err) {
-    console.log("Akira error:", err);
-    await message.reply("Akira hit an error.");
+    console.log("Message handler error:", err);
+    try {
+      await message.reply("Akira hit an error.");
+    } catch {}
   }
 });
 
 client.initialize();
+
+process.on("uncaughtException", (err) => {
+  console.log("Uncaught exception:", err);
+});
+
+process.on("unhandledRejection", (err) => {
+  console.log("Unhandled rejection:", err);
+});

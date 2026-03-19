@@ -1,0 +1,14 @@
+services:
+  akira:
+    build: .
+    container_name: akira-dev-team
+    restart: "no"
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      PERPLEXITY_API_KEY: ${PERPLEXITY_API_KEY}
+      PUPPETEER_EXECUTABLE_PATH: /usr/bin/chromium
+      PUPPETEER_SKIP_DOWNLOAD: "true"
+    volumes:
+      - ./:/app
+    stdin_open: true
+    tty: true

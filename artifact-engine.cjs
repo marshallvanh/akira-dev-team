@@ -1,272 +1,179 @@
-const Anthropic = require("@anthropic-ai/sdk");
 const fs = require("fs");
 const path = require("path");
+const { execSync } = require("child_process");
 
-let puppeteer = null;
+const WORKSPACE = path.join(__dirname, "workspace", "artifacts");
 
-try {
-  puppeteer = require("puppeteer");
-} catch {
-  try {
-    puppeteer = require("puppeteer-core");
-  } catch {
-    puppeteer = null;
+function ensureWorkspace() {
+  if (!fs.existsSync(WORKSPACE)) {
+    fs.mkdirSync(WORKSPACE, { recursive: true });
   }
 }
 
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY
-});
-
-const MODEL = "claude-haiku-4-5";
-const WORKSPACE = path.join(__dirname, "workspace");
-const ARTIFACTS_DIR = path.join(WORKSPACE, "artifacts");
-
-function ensureDir(dir) {
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
-}
-
-function cleanJson(text) {
+function cleanInput(text) {
   return String(text || "")
-    .replace(/```json/g, "")
-    .replace(/```/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9,\s]/g, "")
     .trim();
 }
 
-function slugify(text) {
-  return String(text || "artifact")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "") || "artifact";
-}
+/* =========================
+   FLOWCHART (PHASE 1)
+========================= */
 
-function detectArtifactType(message) {
-  const text = String(message || "").toLowerCase();
+function extractSteps(text) {
+  const cleaned = cleanInput(text);
 
-  if (text.includes("flowchart") || text.includes("flow chart")) return "flowchart";
-  if (text.includes("workflow")) return "workflow";
-  if (text.includes("roadmap")) return "roadmap";
-  if (text.includes("wireframe")) return "wireframe";
-  if (text.includes("graph")) return "graph";
-  if (text.includes("diagram")) return "diagram";
+  const parts = cleaned
+    .split(/with|and|,/)
+    .map(s => s.trim())
+    .filter(Boolean);
 
-  return "artifact";
-}
-
-function systemPromptForType(type) {
-  if (["flowchart", "workflow", "roadmap", "graph", "diagram"].includes(type)) {
-    return `
-You create Mermaid diagrams.
-
-Return ONLY valid JSON:
-{
-  "title": "short title",
-  "summary": "short founder-friendly explanation",
-  "filename": "short-file-name",
-  "content": "valid Mermaid only"
-}
-
-Rules:
-- content must be valid Mermaid
-- do not wrap in markdown fences
-- keep labels readable
-- keep it useful for a founder
-- default to flowchart TD unless another Mermaid format clearly fits better
-`;
-  }
-
-  if (type === "wireframe") {
-    return `
-You create simple text wireframes.
-
-Return ONLY valid JSON:
-{
-  "title": "short title",
-  "summary": "short founder-friendly explanation",
-  "filename": "short-file-name",
-  "content": "markdown wireframe"
-}
-
-Rules:
-- plain markdown
-- practical and easy to understand
-`;
-  }
-
-  return `
-Return ONLY valid JSON:
-{
-  "title": "short title",
-  "summary": "short founder-friendly explanation",
-  "filename": "short-file-name",
-  "content": "artifact content"
-}
-`;
-}
-
-async function renderMermaidToPng(baseName, mermaidContent, title) {
-  if (!puppeteer) {
-    return {
-      ok: false,
-      error: "Puppeteer is not installed, so PNG rendering is unavailable."
-    };
-  }
-
-  let browser;
-
-  try {
-    browser = await puppeteer.launch({
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage"
-      ]
-    });
-
-    const page = await browser.newPage();
-    await page.setViewport({
-      width: 1800,
-      height: 1400,
-      deviceScaleFactor: 2
-    });
-
-    await page.setContent(`
-      <!DOCTYPE html>
-      <html>
-      <body style="margin:0;padding:32px;background:white;">
-        <div id="app"></div>
-        <script type="module">
-          import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
-          mermaid.initialize({ startOnLoad: false, securityLevel: 'loose' });
-          const result = await mermaid.render('diagram-svg', ${JSON.stringify(String(mermaidContent || "").trim())});
-          document.getElementById('app').innerHTML = result.svg;
-        </script>
-      </body>
-      </html>
-    `, { waitUntil: "networkidle0" });
-
-    await page.waitForSelector("svg", { timeout: 15000 });
-
-    const app = await page.$("#app");
-    if (!app) {
-      throw new Error("Rendered diagram container not found.");
-    }
-
-    const pngPath = path.join(ARTIFACTS_DIR, `${baseName}.png`);
-    await app.screenshot({
-      path: pngPath,
-      omitBackground: false
-    });
-
-    await browser.close();
-
-    return {
-      ok: true,
-      pngPath
-    };
-  } catch (err) {
-    if (browser) {
-      try {
-        await browser.close();
-      } catch {}
-    }
-
-    return {
-      ok: false,
-      error: err.message || "PNG rendering failed."
-    };
-  }
-}
-
-async function createArtifact(userRequest, activeIdea = "") {
-  ensureDir(WORKSPACE);
-  ensureDir(ARTIFACTS_DIR);
-
-  const type = detectArtifactType(userRequest);
-
-  const prompt = `
-User request:
-${userRequest}
-
-Current active idea:
-${activeIdea || "None"}
-
-Create the requested artifact.
-`;
-
-  const response = await anthropic.messages.create({
-    model: MODEL,
-    max_tokens: 1400,
-    system: systemPromptForType(type),
-    messages: [
-      {
-        role: "user",
-        content: prompt
-      }
-    ]
+  const mapped = parts.map(p => {
+    if (p.includes("login")) return "User Login";
+    if (p.includes("map")) return "View Map";
+    if (p.includes("alert")) return "Set Alerts";
+    if (p.includes("notification")) return "Notifications";
+    if (p.includes("job")) return "Manage Jobs";
+    if (p.includes("invoice")) return "Create Invoice";
+    if (p.includes("payment")) return "Process Payment";
+    return p.charAt(0).toUpperCase() + p.slice(1);
   });
 
-  const raw = cleanJson(response.content?.[0]?.text || "");
-  let parsed;
+  return [...new Set(mapped)];
+}
 
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    parsed = {
-      title: "Artifact",
-      summary: "Artifact created.",
-      filename: "artifact",
-      content: raw
-    };
+function buildFlow(steps) {
+  let diagram = "flowchart TD\n";
+
+  steps.forEach((step, i) => {
+    const id = String.fromCharCode(65 + i);
+    diagram += `${id}[${step}]\n`;
+
+    if (i > 0) {
+      const prev = String.fromCharCode(65 + i - 1);
+      diagram += `${prev} --> ${id}\n`;
+    }
+  });
+
+  return diagram;
+}
+
+/* =========================
+   WIREFRAME (PHASE 2)
+========================= */
+
+function extractUIBlocks(text) {
+  const cleaned = cleanInput(text);
+
+  const blocks = [];
+
+  if (cleaned.includes("dashboard")) {
+    blocks.push("Header");
+    blocks.push("Stats Cards");
+    blocks.push("Recent Activity");
+    blocks.push("Quick Actions");
   }
 
-  const baseName = slugify(parsed.filename || parsed.title || type);
+  if (cleaned.includes("calorie")) {
+    blocks.push("Header");
+    blocks.push("Daily Calories");
+    blocks.push("Food Log");
+    blocks.push("Add Food Button");
+  }
 
-  if (["flowchart", "workflow", "roadmap", "graph", "diagram"].includes(type)) {
-    const rendered = await renderMermaidToPng(
-      baseName,
-      String(parsed.content || "").trim(),
-      parsed.title || "Diagram"
+  if (cleaned.includes("tradie")) {
+    blocks.push("Header");
+    blocks.push("Jobs List");
+    blocks.push("Add Job Button");
+    blocks.push("Invoices");
+  }
+
+  if (blocks.length === 0) {
+    blocks.push("Header");
+    blocks.push("Main Content");
+    blocks.push("Actions");
+  }
+
+  return blocks;
+}
+
+function buildWireframe(blocks) {
+  let diagram = "flowchart TD\n";
+
+  blocks.forEach((block, i) => {
+    const id = `B${i}`;
+    diagram += `${id}["${block}"]\n`;
+
+    if (i > 0) {
+      const prev = `B${i - 1}`;
+      diagram += `${prev} --> ${id}\n`;
+    }
+  });
+
+  return diagram;
+}
+
+/* =========================
+   MAIN ENGINE
+========================= */
+
+async function createArtifact(prompt = "", contextIdea = "") {
+  try {
+    ensureWorkspace();
+
+    const timestamp = Date.now();
+    const baseName = `artifact-${timestamp}`;
+
+    const inputFile = path.join(WORKSPACE, `${baseName}.mmd`);
+    const outputFile = path.join(WORKSPACE, `${baseName}.png`);
+    const configFile = path.join(WORKSPACE, `${baseName}.json`);
+
+    let diagram;
+    let type;
+
+    const combined = (prompt + " " + contextIdea).toLowerCase();
+
+    if (combined.includes("wireframe") || combined.includes("ui")) {
+      const blocks = extractUIBlocks(combined);
+      diagram = buildWireframe(blocks);
+      type = "wireframe";
+    } else {
+      const steps = extractSteps(combined);
+      diagram = buildFlow(steps);
+      type = "smart-flowchart";
+    }
+
+    fs.writeFileSync(inputFile, diagram);
+
+    fs.writeFileSync(
+      configFile,
+      JSON.stringify({
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium",
+        args: ["--no-sandbox"]
+      })
     );
 
-    if (!rendered.ok) {
-      return {
-        ok: false,
-        error: rendered.error || "PNG rendering failed."
-      };
-    }
+    execSync(
+      `npx mmdc -i "${inputFile}" -o "${outputFile}" -p "${configFile}"`,
+      { stdio: "pipe" }
+    );
 
     return {
       ok: true,
       type,
-      title: String(parsed.title || "Artifact"),
-      summary: String(parsed.summary || "Artifact created."),
-      relativePath: path.relative(__dirname, rendered.pngPath),
-      files: [path.relative(__dirname, rendered.pngPath)],
-      absoluteFiles: [rendered.pngPath],
-      content: String(parsed.content || "")
+      files: [path.basename(outputFile)],
+      absoluteFiles: [outputFile]
+    };
+
+  } catch (err) {
+    return {
+      ok: false,
+      error: err.message
     };
   }
-
-  const mdPath = path.join(ARTIFACTS_DIR, `${baseName}.md`);
-  fs.writeFileSync(mdPath, String(parsed.content || "").trim() + "\n", "utf8");
-
-  return {
-    ok: true,
-    type,
-    title: String(parsed.title || "Artifact"),
-    summary: String(parsed.summary || "Artifact created."),
-    relativePath: path.relative(__dirname, mdPath),
-    files: [path.relative(__dirname, mdPath)],
-    absoluteFiles: [mdPath],
-    content: String(parsed.content || "")
-  };
 }
 
 module.exports = {
-  createArtifact,
-  detectArtifactType
+  createArtifact
 };
